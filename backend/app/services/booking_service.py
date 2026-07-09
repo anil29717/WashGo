@@ -9,7 +9,7 @@ from reportlab.lib import colors
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
-from sqlalchemy import exists, select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -72,6 +72,25 @@ async def _get_washer_for_user(db: AsyncSession, user: User) -> Washer:
     if not washer.is_available:
         raise ValidationError("Washer is not available")
     return washer
+
+
+async def _booking_has_captured_payment(db: AsyncSession, booking_id: UUID) -> bool:
+    result = await db.execute(
+        select(Payment.id).where(
+            Payment.booking_id == booking_id,
+            Payment.status == PaymentStatus.captured,
+        ).limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+def _is_open_dispatch_offer(booking: Booking, washer_id: UUID | None = None) -> bool:
+    """Paid booking still waiting for washer acceptance."""
+    if booking.status != BookingStatus.pending:
+        return False
+    if booking.washer_id is None:
+        return True
+    return washer_id is not None and booking.washer_id == washer_id
 
 
 async def _apply_service_phase(
@@ -298,6 +317,7 @@ async def assign_booking_by_admin(
     booking.washer_id = washer.id
     if booking.status == BookingStatus.pending:
         booking.status = BookingStatus.confirmed
+        await _apply_service_phase(db, booking, "washer_accepted")
     await record_earning_on_accept(db, booking, washer)
     await db.commit()
     await db.refresh(booking)
@@ -447,7 +467,7 @@ async def reschedule_booking_for_customer(
 async def list_open_offers(db: AsyncSession, user: User) -> list[BookingOfferRead]:
     if user.role != UserRole.washer:
         raise ForbiddenError("Only washers can view dispatch offers")
-    await _get_washer_profile_for_user(db, user)
+    washer = await _get_washer_profile_for_user(db, user)
 
     paid = exists(
         select(Payment.id).where(
@@ -459,7 +479,7 @@ async def list_open_offers(db: AsyncSession, user: User) -> list[BookingOfferRea
         select(Booking)
         .where(
             Booking.status == BookingStatus.pending,
-            Booking.washer_id.is_(None),
+            or_(Booking.washer_id.is_(None), Booking.washer_id == washer.id),
             paid,
         )
         .options(selectinload(Booking.car), selectinload(Booking.customer))
@@ -490,13 +510,21 @@ async def list_open_offers(db: AsyncSession, user: User) -> list[BookingOfferRea
 
 async def accept_booking(db: AsyncSession, user: User, booking_id: UUID) -> Booking:
     washer = await _get_washer_for_user(db, user)
-    result = await db.execute(select(Booking).where(Booking.id == booking_id))
+    result = await db.execute(
+        select(Booking).where(Booking.id == booking_id).with_for_update()
+    )
     booking = result.scalar_one_or_none()
     if booking is None:
         raise NotFoundError("Booking not found")
-    if booking.status != BookingStatus.pending or booking.washer_id is not None:
+    if booking.status != BookingStatus.pending:
         raise ConflictError("Booking is no longer available")
-    booking.washer_id = washer.id
+    if booking.washer_id is not None and booking.washer_id != washer.id:
+        raise ConflictError("Booking is assigned to another washer")
+    if not await _booking_has_captured_payment(db, booking.id):
+        raise ValidationError("Booking payment is not confirmed yet")
+
+    if booking.washer_id is None:
+        booking.washer_id = washer.id
     booking.status = BookingStatus.confirmed
     await _apply_service_phase(db, booking, "washer_accepted")
     await record_earning_on_accept(db, booking, washer)
@@ -676,8 +704,15 @@ async def get_booking_detail(db: AsyncSession, user: User, booking_id: UUID) -> 
     elif user.role == UserRole.washer:
         wr = await db.execute(select(Washer).where(Washer.user_id == user.id))
         washer = wr.scalar_one_or_none()
-        if washer is None or booking.washer_id != washer.id:
+        if washer is None:
             raise ForbiddenError("Not allowed to view this booking")
+        assigned = booking.washer_id == washer.id
+        open_offer = _is_open_dispatch_offer(booking, washer.id)
+        if not assigned and not open_offer:
+            raise ForbiddenError("Not allowed to view this booking")
+        if open_offer and not assigned:
+            if not await _booking_has_captured_payment(db, booking.id):
+                raise ForbiddenError("Not allowed to view this booking")
     else:
         if booking.customer_id != user.id:
             raise ForbiddenError("Not allowed to view this booking")

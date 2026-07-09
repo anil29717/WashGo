@@ -1,4 +1,4 @@
-from sqlalchemy import exists, func, select
+from sqlalchemy import exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.booking import Booking, BookingStatus
@@ -32,7 +32,7 @@ async def get_bookings_sync_state(db: AsyncSession, user: User) -> BookingSyncSt
         offers = await db.execute(
             select(func.count(Booking.id), func.max(Booking.updated_at)).where(
                 Booking.status == BookingStatus.pending,
-                Booking.washer_id.is_(None),
+                or_(Booking.washer_id.is_(None), Booking.washer_id == washer.id),
                 paid,
             )
         )
